@@ -1,98 +1,328 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Ticketing API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend ticketing system built with NestJS + TypeScript + MongoDB + Redis, containerised with Docker, deployable to GCP Cloud Run.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Architecture overview
 
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
-
-```bash
-$ npm install
+```
+┌─────────────────────────────────────────────────────────┐
+│  Client (HTTP)                                          │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────┐
+│  NestJS API (Cloud Run, port 8080)                      │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │
+│  │  Venues    │  │  Events    │  │  Seats             │ │
+│  │  Controller│  │  Controller│  │  Controller        │ │
+│  └─────┬──────┘  └─────┬──────┘  └────────┬───────────┘ │
+│        │               │                  │             │
+│  ┌─────▼──────┐  ┌─────▼──────┐  ┌────────▼──────────┐ │
+│  │  Venues    │  │  Events    │  │  Seats Service     │ │
+│  │  Service   │  │  Service   │  │  (Lua atomic hold) │ │
+│  └─────┬──────┘  └─────┬──────┘  └────────┬───────────┘ │
+│        │               │                  │             │
+│  ┌─────▼───────────────▼──────────────────▼──────────┐ │
+│  │  MongoDB (Mongoose)          Redis (ioredis)       │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Compile and run the project
+### Redis seat-hold design
 
-```bash
-# development
-$ npm run start
+Seat holds are stored as `seat:hold:{eventId}:{seatId}` keys in Redis with a configurable TTL (default 600 s).
 
-# watch mode
-$ npm run start:dev
+A **Lua script** (`src/seats/scripts/hold-seats.lua`) ensures atomic all-or-nothing multi-seat reservation:
 
-# production mode
-$ npm run start:prod
+```lua
+for i = 1, #KEYS do
+  if redis.call('EXISTS', KEYS[i]) == 1 then
+    for j = 1, i-1 do redis.call('DEL', KEYS[j]) end
+    return 0
+  end
+  redis.call('SET', KEYS[i], ARGV[1], 'EX', ARGV[2])
+end
+return 1
 ```
 
-## Run tests
+If *any* seat is already held, all previously-set keys in that same call are rolled back and `0` is returned — guaranteeing no partial holds. This is proven by `test/seats.concurrency.spec.ts` which fires 50 parallel hold requests and asserts exactly 1 succeeds.
+
+### Price tiers
+
+| Tier     | Multiplier | Example (basePrice=100) |
+|----------|-----------|-------------------------|
+| standard | 1.0×      | MYR 100                 |
+| premium  | 1.5×      | MYR 150                 |
+| vip      | 2.0×      | MYR 200                 |
+
+## Local development (Docker Compose)
 
 ```bash
-# unit tests
-$ npm run test
+# Start API + MongoDB + Redis
+docker compose up --build
 
-# e2e tests
-$ npm run test:e2e
+# Health check
+curl http://localhost:3000/health
+# → {"status":"ok"}
 
-# test coverage
-$ npm run test:cov
+# Swagger UI
+open http://localhost:3000/api/docs
 ```
 
-## Deployment
+## Local development (without Docker)
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+Prerequisites: Node 22, MongoDB running locally, Redis running locally.
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+npm install
+
+# Set env vars (or create .env)
+export MONGO_URI=mongodb://localhost:27017/ticketing
+export REDIS_URL=redis://localhost:6379
+export SEAT_HOLD_TTL_SECONDS=300
+
+npm run start:dev
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+## Environment variables
 
-## Resources
+| Variable               | Required | Default     | Description                          |
+|------------------------|----------|-------------|--------------------------------------|
+| `MONGO_URI`            | yes      | —           | MongoDB connection string            |
+| `REDIS_URL`            | yes      | —           | Redis connection string              |
+| `PORT`                 | no       | `8080`      | HTTP listener port                   |
+| `SEAT_HOLD_TTL_SECONDS`| no       | `600`       | Seat hold TTL in seconds             |
+| `NODE_ENV`             | no       | `development`| Runtime environment                 |
 
-Check out a few resources that may come in handy when working with NestJS:
+## Tests
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```bash
+# Unit tests
+npm run test
 
-## Support
+# Unit tests with coverage (target: >85%)
+npm run test:cov
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+# E2E tests (requires live Mongo + Redis)
+npm run test:e2e
 
-## Stay in touch
+# Concurrency test (50 parallel holds → exactly 1 succeeds)
+npm run test:concurrency
+```
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+Coverage: **94.55% statements / 94.73% lines** (91 unit tests, 31 e2e tests).
 
-## License
+## GCP Cloud Run deployment
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### Prerequisites
+
+```bash
+# Install gcloud CLI and authenticate
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+
+# Enable required APIs
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com
+```
+
+### 1. Create Artifact Registry repository
+
+```bash
+gcloud artifacts repositories create ticketing-api \
+  --repository-format=docker \
+  --location=asia-southeast1 \
+  --description="Ticketing API Docker images"
+```
+
+### 2. Build and push image
+
+```bash
+export PROJECT_ID=$(gcloud config get-value project)
+export REGION=asia-southeast1
+export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/ticketing-api/ticketing-api:latest"
+
+gcloud auth configure-docker ${REGION}-docker.pkg.dev
+
+docker build -t $IMAGE .
+docker push $IMAGE
+```
+
+### 3. Deploy to Cloud Run
+
+```bash
+gcloud run deploy ticketing-api \
+  --image=$IMAGE \
+  --region=$REGION \
+  --platform=managed \
+  --allow-unauthenticated \
+  --port=8080 \
+  --min-instances=0 \
+  --max-instances=10 \
+  --memory=512Mi \
+  --cpu=1 \
+  --set-env-vars="NODE_ENV=production" \
+  --set-env-vars="MONGO_URI=YOUR_ATLAS_CONNECTION_STRING" \
+  --set-env-vars="REDIS_URL=YOUR_UPSTASH_REDIS_URL" \
+  --set-env-vars="SEAT_HOLD_TTL_SECONDS=600"
+```
+
+### 4. Verify deployment
+
+```bash
+SERVICE_URL=$(gcloud run services describe ticketing-api \
+  --region=$REGION \
+  --format="value(status.url)")
+
+curl ${SERVICE_URL}/health
+# → {"status":"ok"}
+```
+
+### Recommended managed services (free tier)
+
+- **MongoDB**: [MongoDB Atlas M0](https://www.mongodb.com/cloud/atlas) — free 512 MB cluster
+- **Redis**: [Upstash Redis](https://upstash.com/) — free 10K commands/day
+
+## API quick-start (cURL examples)
+
+Replace `BASE_URL` with your Cloud Run URL or `http://localhost:3000`.
+
+```bash
+export BASE_URL=http://localhost:3000
+```
+
+### Create a venue
+
+```bash
+curl -s -X POST $BASE_URL/venues \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Arena KL",
+    "address": "Kuala Lumpur",
+    "seatMap": [
+      {"section": "A", "row": "1", "number": "1", "priceTier": "standard"},
+      {"section": "A", "row": "1", "number": "2", "priceTier": "vip"}
+    ]
+  }' | jq .
+```
+
+### List venues
+
+```bash
+curl -s $BASE_URL/venues | jq .
+```
+
+### Create an event
+
+```bash
+export VENUE_ID=<venueId from above>
+
+curl -s -X POST $BASE_URL/events \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"name\": \"Rock Night\",
+    \"venueId\": \"$VENUE_ID\",
+    \"startAt\": \"2026-08-15T20:00:00.000Z\",
+    \"endAt\": \"2026-08-15T23:30:00.000Z\",
+    \"basePrice\": 100,
+    \"currency\": \"MYR\"
+  }" | jq .
+```
+
+### Publish an event
+
+```bash
+export EVENT_ID=<eventId from above>
+
+curl -s -X PATCH $BASE_URL/events/$EVENT_ID \
+  -H 'Content-Type: application/json' \
+  -d '{"status": "published"}' | jq .
+```
+
+### View seat map
+
+```bash
+curl -s $BASE_URL/events/$EVENT_ID/seats | jq .
+```
+
+### Hold seats
+
+```bash
+export SEAT_IDS=$(curl -s $BASE_URL/events/$EVENT_ID/seats | jq -r '[.seats[].id] | @json')
+
+curl -s -X POST $BASE_URL/events/$EVENT_ID/seats/hold \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: user-001' \
+  -d "{\"seatIds\": $SEAT_IDS}" | jq .
+```
+
+### Release seats
+
+```bash
+curl -s -X POST $BASE_URL/events/$EVENT_ID/seats/release \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: user-001' \
+  -d "{\"seatIds\": $SEAT_IDS}" | jq .
+```
+
+### Confirm order (hold seats first)
+
+```bash
+curl -s -X POST $BASE_URL/orders \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: user-001' \
+  -d "{\"seatIds\": $SEAT_IDS}" | jq .
+```
+
+### Get order
+
+```bash
+export ORDER_ID=<orderId from above>
+curl -s $BASE_URL/orders/$ORDER_ID | jq .
+```
+
+### List my orders
+
+```bash
+curl -s $BASE_URL/orders \
+  -H 'x-user-id: user-001' | jq .
+```
+
+### Get ticket
+
+```bash
+export TICKET_ID=<ticketId from order response>
+curl -s $BASE_URL/tickets/$TICKET_ID | jq .
+```
+
+### Health check
+
+```bash
+curl -s $BASE_URL/health | jq .
+```
+
+## OpenAPI specification
+
+The full OpenAPI 3.1 spec is at [`docs/openapi.yaml`](docs/openapi.yaml).
+
+Interactive docs (Swagger UI) available at `/api/docs` when the server is running.
+
+## Project structure
+
+```
+src/
+├── common/
+│   ├── exceptions/     # RFC 7807 domain exceptions
+│   ├── filters/        # HttpExceptionFilter (problem+json)
+│   └── redis/          # Redis + Lua script providers
+├── config/             # Joi env validation
+├── events/             # Events CRUD + seat generation
+├── health/             # GET /health
+├── orders/             # Order confirmation (MongoDB transaction)
+├── seats/
+│   ├── scripts/        # hold-seats.lua (atomic Lua script)
+│   └── ...             # Seat map + hold/release logic
+├── tickets/            # Ticket read endpoints
+└── venues/             # Venue CRUD
+test/
+├── app.e2e-spec.ts     # 31 full happy-path e2e tests
+└── seats.concurrency.spec.ts  # 50-parallel hold stress test
+```
