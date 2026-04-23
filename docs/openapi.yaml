@@ -1,0 +1,964 @@
+openapi: 3.1.0
+info:
+  title: AirAsia MOVE Ticketing API
+  description: |
+    Backend ticketing system with reserved seating for AirAsia MOVE technical assessment.
+
+    ## Authentication
+    No authentication is required. Endpoints that need user attribution accept an `x-user-id` header.
+
+    ## Seat Hold Model
+    Seats are held atomically via Redis with a 10-minute TTL.
+    A Lua script ensures multi-seat holds are all-or-nothing — no partial holds under concurrency.
+    On order confirmation, holds are deleted and seats are marked `booked` in a MongoDB transaction.
+  version: 1.0.0
+  contact:
+    name: AirAsia MOVE Assessment
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://ticketing-api-REPLACE.a.run.app
+    description: GCP Cloud Run (production)
+
+tags:
+  - name: health
+    description: Service health check
+  - name: venues
+    description: Venue management and seat map configuration
+  - name: events
+    description: Event lifecycle management
+  - name: seats
+    description: Seat availability and reservation (bonus feature)
+  - name: orders
+    description: Order creation and confirmation
+  - name: tickets
+    description: Ticket retrieval
+
+# ─────────────────────────────────────────────
+# SECURITY
+# ─────────────────────────────────────────────
+security: []
+
+components:
+  securitySchemes:
+    UserIdHeader:
+      type: apiKey
+      in: header
+      name: x-user-id
+      description: Required on endpoints that need user attribution (orders, holds, releases)
+
+  # ─────────────────────────────────────────────
+  # SCHEMAS
+  # ─────────────────────────────────────────────
+  schemas:
+
+    # ── Venue ──────────────────────────────────
+    SeatTemplate:
+      type: object
+      required: [section, row, number, priceTier]
+      properties:
+        section:
+          type: string
+          example: A
+        row:
+          type: string
+          example: "1"
+        number:
+          type: string
+          example: "5"
+        priceTier:
+          type: string
+          enum: [standard, premium, vip]
+          example: standard
+
+    SeatMap:
+      type: array
+      items:
+        $ref: '#/components/schemas/SeatTemplate'
+      description: Flat list of all physical seats in the venue
+
+    CreateVenueDto:
+      type: object
+      required: [name, address, seatMap]
+      properties:
+        name:
+          type: string
+          example: Axiata Arena
+        address:
+          type: string
+          example: Bukit Jalil, Kuala Lumpur
+        seatMap:
+          $ref: '#/components/schemas/SeatMap'
+
+    UpdateVenueDto:
+      type: object
+      properties:
+        name:
+          type: string
+        address:
+          type: string
+
+    Venue:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 664f1a2b3c4d5e6f7a8b9c0d
+        name:
+          type: string
+          example: Axiata Arena
+        address:
+          type: string
+          example: Bukit Jalil, Kuala Lumpur
+        seatMap:
+          $ref: '#/components/schemas/SeatMap'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ── Event ──────────────────────────────────
+    CreateEventDto:
+      type: object
+      required: [name, venueId, startAt, endAt, basePrice, currency]
+      properties:
+        name:
+          type: string
+          example: Taylor Swift Eras Tour KL
+        description:
+          type: string
+          example: The greatest tour of all time
+        venueId:
+          type: string
+          example: 664f1a2b3c4d5e6f7a8b9c0d
+        startAt:
+          type: string
+          format: date-time
+          example: "2026-08-15T20:00:00.000Z"
+        endAt:
+          type: string
+          format: date-time
+          example: "2026-08-15T23:30:00.000Z"
+        basePrice:
+          type: number
+          format: float
+          example: 350.00
+        currency:
+          type: string
+          example: MYR
+
+    UpdateEventDto:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        startAt:
+          type: string
+          format: date-time
+        endAt:
+          type: string
+          format: date-time
+        basePrice:
+          type: number
+        status:
+          type: string
+          enum: [draft, published, cancelled]
+
+    Event:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 774f1a2b3c4d5e6f7a8b9c0e
+        name:
+          type: string
+          example: Taylor Swift Eras Tour KL
+        description:
+          type: string
+        venueId:
+          type: string
+          example: 664f1a2b3c4d5e6f7a8b9c0d
+        startAt:
+          type: string
+          format: date-time
+        endAt:
+          type: string
+          format: date-time
+        basePrice:
+          type: number
+          example: 350.00
+        currency:
+          type: string
+          example: MYR
+        status:
+          type: string
+          enum: [draft, published, cancelled]
+          example: published
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    EventListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        total:
+          type: integer
+          example: 42
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+
+    # ── Seat ───────────────────────────────────
+    Seat:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 884f1a2b3c4d5e6f7a8b9c0f
+        eventId:
+          type: string
+          example: 774f1a2b3c4d5e6f7a8b9c0e
+        section:
+          type: string
+          example: A
+        row:
+          type: string
+          example: "1"
+        number:
+          type: string
+          example: "5"
+        priceTier:
+          type: string
+          enum: [standard, premium, vip]
+        price:
+          type: number
+          description: Computed from basePrice × priceTier multiplier
+          example: 350.00
+        status:
+          type: string
+          enum: [available, held, booked]
+          example: available
+        heldBy:
+          type: string
+          nullable: true
+          description: userId currently holding this seat (from Redis), null if available/booked
+          example: user-123
+        heldUntil:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the hold expires (TTL from Redis)
+
+    SeatMapResponse:
+      type: object
+      properties:
+        eventId:
+          type: string
+        seats:
+          type: array
+          items:
+            $ref: '#/components/schemas/Seat'
+        summary:
+          type: object
+          properties:
+            total:
+              type: integer
+              example: 200
+            available:
+              type: integer
+              example: 147
+            held:
+              type: integer
+              example: 12
+            booked:
+              type: integer
+              example: 41
+
+    HoldSeatsDto:
+      type: object
+      required: [seatIds]
+      properties:
+        seatIds:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          example: ["884f1a2b3c4d5e6f7a8b9c0f", "884f1a2b3c4d5e6f7a8b9c10"]
+
+    HoldSeatsResponse:
+      type: object
+      properties:
+        holdToken:
+          type: string
+          description: Opaque token representing this hold (seatIds + userId encoded)
+          example: "hold_user123_1748000000"
+        seatIds:
+          type: array
+          items:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2026-04-23T12:10:00.000Z"
+
+    ReleaseSeatsDto:
+      type: object
+      required: [seatIds]
+      properties:
+        seatIds:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          example: ["884f1a2b3c4d5e6f7a8b9c0f"]
+
+    # ── Order ──────────────────────────────────
+    CreateOrderDto:
+      type: object
+      required: [seatIds]
+      properties:
+        seatIds:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          example: ["884f1a2b3c4d5e6f7a8b9c0f", "884f1a2b3c4d5e6f7a8b9c10"]
+
+    Order:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 994f1a2b3c4d5e6f7a8b9c11
+        userId:
+          type: string
+          example: user-123
+        eventId:
+          type: string
+          example: 774f1a2b3c4d5e6f7a8b9c0e
+        ticketIds:
+          type: array
+          items:
+            type: string
+        totalAmount:
+          type: number
+          example: 700.00
+        currency:
+          type: string
+          example: MYR
+        status:
+          type: string
+          enum: [pending, confirmed, cancelled]
+          example: confirmed
+        tickets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+          description: Embedded tickets in creation response
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    OrderListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        total:
+          type: integer
+
+    # ── Ticket ─────────────────────────────────
+    Ticket:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: aa4f1a2b3c4d5e6f7a8b9c12
+        eventId:
+          type: string
+          example: 774f1a2b3c4d5e6f7a8b9c0e
+        seatId:
+          type: string
+          example: 884f1a2b3c4d5e6f7a8b9c0f
+        orderId:
+          type: string
+          example: 994f1a2b3c4d5e6f7a8b9c11
+        userId:
+          type: string
+          example: user-123
+        section:
+          type: string
+          example: A
+        row:
+          type: string
+          example: "1"
+        number:
+          type: string
+          example: "5"
+        price:
+          type: number
+          example: 350.00
+        currency:
+          type: string
+          example: MYR
+        status:
+          type: string
+          enum: [active, cancelled, used]
+          example: active
+        createdAt:
+          type: string
+          format: date-time
+
+    # ── Errors (RFC 7807) ──────────────────────
+    ProblemDetail:
+      type: object
+      properties:
+        type:
+          type: string
+          example: about:blank
+        title:
+          type: string
+          example: Seat already held
+        status:
+          type: integer
+          example: 409
+        detail:
+          type: string
+          example: Seat 884f1a2b3c4d5e6f7a8b9c0f is already held by another user
+        instance:
+          type: string
+          example: /events/774f1a2b3c4d5e6f7a8b9c0e/seats/hold
+
+  # ─────────────────────────────────────────────
+  # RESPONSES (reusable)
+  # ─────────────────────────────────────────────
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+    Conflict:
+      description: Conflict — seat already held or order already confirmed
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+    Forbidden:
+      description: Forbidden — seat not held by this user
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+    BadRequest:
+      description: Validation error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+  # ─────────────────────────────────────────────
+  # PARAMETERS (reusable)
+  # ─────────────────────────────────────────────
+  parameters:
+    UserIdHeader:
+      name: x-user-id
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Caller's user identifier (no auth required — used for attribution)
+      example: user-123
+
+    EventIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Event MongoDB ObjectId
+
+    VenueIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Venue MongoDB ObjectId
+
+    OrderIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Order MongoDB ObjectId
+
+    TicketIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Ticket MongoDB ObjectId
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+paths:
+
+  # ── Health ───────────────────────────────────
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      description: Returns 200 when the service is running. Used by Cloud Run readiness probe.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  # ── Venues ───────────────────────────────────
+  /venues:
+    post:
+      tags: [venues]
+      summary: Create a venue
+      description: Creates a venue with a seat map template. Seats are generated from this map when an event is created.
+      operationId: createVenue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVenueDto'
+            example:
+              name: Axiata Arena
+              address: Bukit Jalil, Kuala Lumpur
+              seatMap:
+                - { section: A, row: "1", number: "1", priceTier: vip }
+                - { section: A, row: "1", number: "2", priceTier: vip }
+                - { section: B, row: "1", number: "1", priceTier: standard }
+      responses:
+        '201':
+          description: Venue created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+    get:
+      tags: [venues]
+      summary: List all venues
+      operationId: listVenues
+      responses:
+        '200':
+          description: List of venues
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Venue'
+
+  /venues/{id}:
+    get:
+      tags: [venues]
+      summary: Get a venue by ID
+      operationId: getVenue
+      parameters:
+        - $ref: '#/components/parameters/VenueIdPath'
+      responses:
+        '200':
+          description: Venue found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [venues]
+      summary: Update a venue
+      operationId: updateVenue
+      parameters:
+        - $ref: '#/components/parameters/VenueIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVenueDto'
+      responses:
+        '200':
+          description: Venue updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [venues]
+      summary: Delete a venue
+      operationId: deleteVenue
+      parameters:
+        - $ref: '#/components/parameters/VenueIdPath'
+      responses:
+        '204':
+          description: Venue deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Events ───────────────────────────────────
+  /events:
+    post:
+      tags: [events]
+      summary: Create an event
+      description: |
+        Creates an event linked to a venue. Automatically generates Seat documents
+        from the venue's seat map (one per physical seat, status `available`).
+        Seats are frozen at creation time.
+      operationId: createEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEventDto'
+            example:
+              name: Taylor Swift Eras Tour KL
+              description: The greatest tour of all time
+              venueId: 664f1a2b3c4d5e6f7a8b9c0d
+              startAt: "2026-08-15T20:00:00.000Z"
+              endAt: "2026-08-15T23:30:00.000Z"
+              basePrice: 350.00
+              currency: MYR
+      responses:
+        '201':
+          description: Event created with seat map generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    get:
+      tags: [events]
+      summary: List events
+      operationId: listEvents
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [draft, published, cancelled]
+          description: Filter by event status
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: Paginated list of events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventListResponse'
+
+  /events/{id}:
+    get:
+      tags: [events]
+      summary: Get an event by ID
+      operationId: getEvent
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+      responses:
+        '200':
+          description: Event found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [events]
+      summary: Update an event
+      operationId: updateEvent
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateEventDto'
+      responses:
+        '200':
+          description: Event updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [events]
+      summary: Cancel an event
+      description: Sets event status to `cancelled`. Does not delete the document.
+      operationId: cancelEvent
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+      responses:
+        '200':
+          description: Event cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Seats ────────────────────────────────────
+  /events/{id}/seats:
+    get:
+      tags: [seats]
+      summary: Get seat map with live availability
+      description: |
+        Returns all seats for the event. Availability merges MongoDB (booked) with
+        Redis (held) state in real-time. Shows who holds each seat and when the hold expires.
+      operationId: getSeatMap
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+      responses:
+        '200':
+          description: Seat map with live availability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatMapResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /events/{id}/seats/hold:
+    post:
+      tags: [seats]
+      summary: Hold seats (atomic)
+      description: |
+        Atomically holds one or more seats using a Redis Lua script.
+        All seats are claimed or none are (no partial holds).
+        Hold expires after 10 minutes (SEAT_HOLD_TTL_SECONDS env var).
+        Requires `x-user-id` header.
+      operationId: holdSeats
+      security:
+        - UserIdHeader: []
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+        - $ref: '#/components/parameters/UserIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldSeatsDto'
+      responses:
+        '201':
+          description: Seats held successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldSeatsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /events/{id}/seats/release:
+    post:
+      tags: [seats]
+      summary: Release held seats
+      description: |
+        Releases seats held by the calling user. Only the user who holds a seat
+        can release it — attempting to release another user's hold returns 403.
+        Requires `x-user-id` header.
+      operationId: releaseSeats
+      security:
+        - UserIdHeader: []
+      parameters:
+        - $ref: '#/components/parameters/EventIdPath'
+        - $ref: '#/components/parameters/UserIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseSeatsDto'
+      responses:
+        '200':
+          description: Seats released
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  released:
+                    type: array
+                    items:
+                      type: string
+                    example: ["884f1a2b3c4d5e6f7a8b9c0f"]
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Orders ───────────────────────────────────
+  /orders:
+    post:
+      tags: [orders]
+      summary: Confirm an order from held seats
+      description: |
+        Converts held seats into a confirmed order and issues tickets.
+        Inside a MongoDB transaction:
+        1. Verifies all seat holds belong to the calling user
+        2. Creates Ticket documents (one per seat)
+        3. Creates Order with ticketIds and totalAmount
+        4. Updates Seat documents → status `booked`
+        5. Deletes Redis holds
+        Requires `x-user-id` header.
+      operationId: createOrder
+      security:
+        - UserIdHeader: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderDto'
+      responses:
+        '201':
+          description: Order confirmed with tickets issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    get:
+      tags: [orders]
+      summary: List orders
+      operationId: listOrders
+      security:
+        - UserIdHeader: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdHeader'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Orders for the calling user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderListResponse'
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Get an order by ID
+      operationId: getOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: Order found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Tickets ──────────────────────────────────
+  /tickets/{id}:
+    get:
+      tags: [tickets]
+      summary: Get a ticket by ID
+      operationId: getTicket
+      parameters:
+        - $ref: '#/components/parameters/TicketIdPath'
+      responses:
+        '200':
+          description: Ticket found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '404':
+          $ref: '#/components/responses/NotFound'
