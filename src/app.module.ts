@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { envValidationSchema } from './config/env.validation';
+import { RedisModule } from './common/redis/redis.module';
 import { HealthModule } from './health/health.module';
 import { VenuesModule } from './venues/venues.module';
 import { EventsModule } from './events/events.module';
@@ -22,6 +23,7 @@ import { TicketsModule } from './tickets/tickets.module';
         uri: config.get<string>('MONGO_URI'),
       }),
     }),
+    RedisModule,
     HealthModule,
     VenuesModule,
     EventsModule,
