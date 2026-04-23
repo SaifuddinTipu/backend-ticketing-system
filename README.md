@@ -146,40 +146,52 @@ docker build -t $IMAGE .
 docker push $IMAGE
 ```
 
-### 3. Deploy to Cloud Run
+### 3. Deploy on a GCE VM with Docker Compose
+
+Cloud Run is stateless and cannot run MongoDB + Redis sidecars. The simplest all-GCP approach is a single **e2-micro** Compute Engine VM running `docker compose up` — no third-party accounts required.
 
 ```bash
-gcloud run deploy ticketing-api \
-  --image=$IMAGE \
-  --region=$REGION \
-  --platform=managed \
-  --allow-unauthenticated \
-  --port=8080 \
-  --min-instances=0 \
-  --max-instances=10 \
-  --memory=512Mi \
-  --cpu=1 \
-  --set-env-vars="NODE_ENV=production" \
-  --set-env-vars="MONGO_URI=YOUR_ATLAS_CONNECTION_STRING" \
-  --set-env-vars="REDIS_URL=YOUR_UPSTASH_REDIS_URL" \
-  --set-env-vars="SEAT_HOLD_TTL_SECONDS=600"
+# Create the VM (e2-micro is free-tier eligible)
+gcloud compute instances create ticketing-vm \
+  --zone=asia-southeast1-b \
+  --machine-type=e2-micro \
+  --image-family=cos-stable \
+  --image-project=cos-cloud \
+  --tags=http-server \
+  --metadata=startup-script='#! /bin/bash
+    docker pull YOUR_IMAGE
+    docker network create app || true
+    docker run -d --name mongo --network app mongo:7
+    docker run -d --name redis --network app redis:7-alpine
+    docker run -d --name api --network app \
+      -p 80:8080 \
+      -e NODE_ENV=production \
+      -e MONGO_URI=mongodb://mongo:27017/ticketing \
+      -e REDIS_URL=redis://redis:6379 \
+      -e SEAT_HOLD_TTL_SECONDS=600 \
+      YOUR_IMAGE'
+
+# Allow HTTP traffic
+gcloud compute firewall-rules create allow-http \
+  --allow=tcp:80 \
+  --target-tags=http-server
 ```
+
+> Replace `YOUR_IMAGE` with the Artifact Registry image URI from step 2.
 
 ### 4. Verify deployment
 
 ```bash
-SERVICE_URL=$(gcloud run services describe ticketing-api \
-  --region=$REGION \
-  --format="value(status.url)")
+VM_IP=$(gcloud compute instances describe ticketing-vm \
+  --zone=asia-southeast1-b \
+  --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
-curl ${SERVICE_URL}/health
+curl http://${VM_IP}/health
 # → {"status":"ok"}
+
+# Swagger UI
+echo "http://${VM_IP}/api/docs"
 ```
-
-### Recommended managed services (free tier)
-
-- **MongoDB**: [MongoDB Atlas M0](https://www.mongodb.com/cloud/atlas) — free 512 MB cluster
-- **Redis**: [Upstash Redis](https://upstash.com/) — free 10K commands/day
 
 ## API quick-start (cURL examples)
 
