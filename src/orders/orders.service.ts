@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection, Model, Types } from 'mongoose';
 import Redis from 'ioredis';
@@ -15,6 +15,8 @@ import {
 
 @Injectable()
 export class OrdersService {
+  private readonly logger = new Logger(OrdersService.name);
+
   constructor(
     @InjectModel(Order.name) private orderModel: Model<OrderDocument>,
     @InjectModel(Ticket.name) private ticketModel: Model<TicketDocument>,
@@ -27,52 +29,31 @@ export class OrdersService {
     return `seat:hold:${eventId}:${seatId}`;
   }
 
-  async create(dto: CreateOrderDto, userId: string): Promise<OrderDocument & { tickets: TicketDocument[] }> {
-    // Load all seats to determine eventId and prices
-    const seats = await this.seatModel
-      .find({ _id: { $in: dto.seatIds.map((id) => new Types.ObjectId(id)) } })
-      .exec();
+  private async executeConfirmation(
+    seats: SeatDocument[],
+    userId: string,
+    totalAmount: number,
+    currency: string,
+  ): Promise<{ order: OrderDocument; tickets: TicketDocument[] }> {
+    const ticketDocs = seats.map((seat) => ({
+      eventId: seat.eventId,
+      seatId: seat._id,
+      userId,
+      section: seat.section,
+      row: seat.row,
+      number: seat.number,
+      price: seat.price,
+      currency,
+    }));
 
-    if (seats.length !== dto.seatIds.length) {
-      throw new SeatsNotHeldException();
-    }
-
-    // Verify every seat hold in Redis belongs to this user
-    const eventId = seats[0].eventId.toString();
-    for (const seat of seats) {
-      const key = this.holdKey(seat.eventId.toString(), seat._id.toString());
-      const holder = await this.redis.get(key);
-      if (holder !== userId) {
-        throw new SeatsNotHeldException();
-      }
-    }
-
-    const totalAmount = seats.reduce((sum, s) => sum + s.price, 0);
-    const currency = 'MYR';
-
-    // MongoDB transaction: create tickets + order + mark seats booked + delete holds
     const session = await this.connection.startSession();
     let order!: OrderDocument;
     let tickets!: TicketDocument[];
 
     try {
       await session.withTransaction(async () => {
-        // 1. Create ticket documents
-        tickets = await this.ticketModel.create(
-          seats.map((seat) => ({
-            eventId: seat.eventId,
-            seatId: seat._id,
-            userId,
-            section: seat.section,
-            row: seat.row,
-            number: seat.number,
-            price: seat.price,
-            currency,
-          })),
-          { session },
-        );
+        tickets = await this.ticketModel.create(ticketDocs, { session, ordered: true });
 
-        // 2. Create the order
         const [created] = await this.orderModel.create(
           [
             {
@@ -88,7 +69,6 @@ export class OrdersService {
         );
         order = created;
 
-        // 3. Stamp orderId onto each ticket
         const orderId = order._id as Types.ObjectId;
         await this.ticketModel.updateMany(
           { _id: { $in: tickets.map((t) => t._id) } },
@@ -96,32 +76,86 @@ export class OrdersService {
           { session },
         );
 
-        // 4. Mark seats as booked
         await this.seatModel.updateMany(
           { _id: { $in: seats.map((s) => s._id) } },
           { status: SeatStatus.BOOKED },
           { session },
         );
       });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Standalone MongoDB does not support multi-document transactions.
+      // Fall back to sequential writes (acceptable for local dev; Atlas always supports transactions).
+      if (msg.includes('Transaction numbers') || msg.includes('replica set') || msg.includes('MongoServerError')) {
+        this.logger.warn('Transactions not supported — falling back to sequential writes');
+        tickets = await this.ticketModel.create(ticketDocs);
+        const [created] = await this.orderModel.create([
+          {
+            userId,
+            eventId: seats[0].eventId,
+            ticketIds: tickets.map((t) => t._id),
+            totalAmount: +totalAmount.toFixed(2),
+            currency,
+            status: OrderStatus.CONFIRMED,
+          },
+        ]);
+        order = created;
+        const orderId = order._id as Types.ObjectId;
+        await this.ticketModel.updateMany(
+          { _id: { $in: tickets.map((t) => t._id) } },
+          { orderId },
+        );
+        await this.seatModel.updateMany(
+          { _id: { $in: seats.map((s) => s._id) } },
+          { status: SeatStatus.BOOKED },
+        );
+      } else {
+        throw err;
+      }
     } finally {
       await session.endSession();
     }
 
-    // 5. Delete Redis holds outside the transaction (non-fatal if they already expired)
+    return { order, tickets };
+  }
+
+  async create(dto: CreateOrderDto, userId: string): Promise<Record<string, unknown>> {
+    const seats = await this.seatModel
+      .find({ _id: { $in: dto.seatIds.map((id) => new Types.ObjectId(id)) } })
+      .exec();
+
+    if (seats.length !== dto.seatIds.length) {
+      throw new SeatsNotHeldException();
+    }
+
+    for (const seat of seats) {
+      const key = this.holdKey(seat.eventId.toString(), seat._id.toString());
+      const holder = await this.redis.get(key);
+      if (holder !== userId) {
+        throw new SeatsNotHeldException();
+      }
+    }
+
+    const totalAmount = seats.reduce((sum, s) => sum + s.price, 0);
+    const currency = 'MYR';
+
+    const { order, tickets } = await this.executeConfirmation(seats, userId, totalAmount, currency);
+
+    // Delete Redis holds (non-fatal if already expired)
     const pipeline = this.redis.pipeline();
     seats.forEach((seat) => {
       pipeline.del(this.holdKey(seat.eventId.toString(), seat._id.toString()));
     });
     await pipeline.exec();
 
-    // Stamp orderId on returned tickets (in-memory, already persisted above)
     const orderId = order._id as Types.ObjectId;
     const ticketsWithOrder = tickets.map((t) => {
-      t.orderId = orderId;
-      return t;
+      const obj = t.toObject();
+      obj.orderId = orderId;
+      return obj;
     });
 
-    return Object.assign(order, { tickets: ticketsWithOrder });
+    return { ...order.toObject(), tickets: ticketsWithOrder };
   }
 
   async findAll(

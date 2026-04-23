@@ -78,7 +78,10 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "src/**/*.(t|j)s"
+      "src/**/*.(t|j)s",
+      "!src/main.ts",
+      "!src/**/*.module.ts",
+      "!src/config/env.validation.ts"
     ],
     "coverageDirectory": "./coverage",
     "testEnvironment": "node",

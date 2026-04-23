@@ -17,7 +17,7 @@ export class Ticket {
   @Prop({ type: Types.ObjectId, ref: 'Seat', required: true })
   seatId: Types.ObjectId;
 
-  @Prop({ type: Types.ObjectId, ref: 'Order', required: true })
+  @Prop({ type: Types.ObjectId, ref: 'Order', required: false })
   orderId: Types.ObjectId;
 
   @Prop({ required: true })

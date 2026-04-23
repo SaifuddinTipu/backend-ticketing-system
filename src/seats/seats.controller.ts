@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Param, Post } from '@nestjs/common';
 import {
   ApiHeader,
   ApiOperation,
@@ -40,6 +40,7 @@ export class SeatsController {
   }
 
   @Post('release')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Release held seats (only owner can release)' })
   @ApiParam({ name: 'id', description: 'Event MongoDB ObjectId' })
   @ApiHeader({ name: 'x-user-id', description: 'Caller user ID', required: true })

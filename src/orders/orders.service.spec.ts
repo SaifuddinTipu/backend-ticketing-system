@@ -30,28 +30,34 @@ const makeSeat = (id: Types.ObjectId, price = 100) => ({
   status: SeatStatus.AVAILABLE,
 });
 
-const makeTicket = (id: Types.ObjectId, seatId: Types.ObjectId) => ({
-  _id: id,
-  eventId,
-  seatId,
-  orderId,
-  userId,
-  section: 'A',
-  row: '1',
-  number: '1',
-  price: 100,
-  currency: 'MYR',
-});
+const makeTicket = (id: Types.ObjectId, seatId: Types.ObjectId) => {
+  const t = {
+    _id: id,
+    eventId,
+    seatId,
+    orderId,
+    userId,
+    section: 'A',
+    row: '1',
+    number: '1',
+    price: 100,
+    currency: 'MYR',
+  };
+  return { ...t, toObject: () => ({ ...t }) };
+};
 
-const makeOrder = () => ({
-  _id: orderId,
-  userId,
-  eventId,
-  ticketIds: [ticketId1, ticketId2],
-  totalAmount: 200,
-  currency: 'MYR',
-  status: OrderStatus.CONFIRMED,
-});
+const makeOrder = () => {
+  const o = {
+    _id: orderId,
+    userId,
+    eventId,
+    ticketIds: [ticketId1, ticketId2],
+    totalAmount: 200,
+    currency: 'MYR',
+    status: OrderStatus.CONFIRMED,
+  };
+  return { ...o, toObject: () => ({ ...o }) };
+};
 
 // Session mock that immediately runs the transaction callback
 const mockSession = {
