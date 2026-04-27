@@ -111,86 +111,169 @@ npm run test:concurrency
 
 Coverage: **94.55% statements / 94.73% lines** (91 unit tests, 31 e2e tests).
 
-## GCP Cloud Run deployment
+## GCP Deployment (GCE VM + Docker)
 
-### Prerequisites
+All infrastructure runs inside GCP — no third-party services needed.
+MongoDB and Redis run as Docker containers on the same VM alongside the API.
+
+**Zone used:** `asia-southeast2-b` (Jakarta — closest to Malaysia)
+**Project used:** `airasia-ticketing`
+
+---
+
+### Step 1 — One-time setup
 
 ```bash
-# Install gcloud CLI and authenticate
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
+export PROJECT_ID=airasia-ticketing
+export ZONE=asia-southeast2-b
+export REGION=asia-southeast2
+export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/ticketing-api/ticketing-api"
 
-# Enable required APIs
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com
+gcloud config set project $PROJECT_ID
+
+# Enable APIs (only needed once)
+gcloud services enable artifactregistry.googleapis.com compute.googleapis.com
 ```
 
-### 1. Create Artifact Registry repository
+---
+
+### Step 2 — Create Artifact Registry repository (only needed once)
 
 ```bash
 gcloud artifacts repositories create ticketing-api \
   --repository-format=docker \
-  --location=asia-southeast1 \
+  --location=$REGION \
   --description="Ticketing API Docker images"
 ```
 
-### 2. Build and push image
+---
+
+### Step 3 — Build, tag, and push the image
+
+Run this from the `ticketing-api/` folder every time you want to deploy a new version.
 
 ```bash
-export PROJECT_ID=$(gcloud config get-value project)
-export REGION=asia-southeast1
-export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/ticketing-api/ticketing-api:latest"
-
+# Authenticate Docker to push to GCP
 gcloud auth configure-docker ${REGION}-docker.pkg.dev
 
-docker build -t $IMAGE .
-docker push $IMAGE
+# Build and push (tag with git short SHA for versioning)
+export TAG=$(git rev-parse --short HEAD)
+docker build -t ${IMAGE}:${TAG} -t ${IMAGE}:latest .
+docker push ${IMAGE}:${TAG}
+docker push ${IMAGE}:latest
+
+echo "Pushed: ${IMAGE}:${TAG}"
 ```
 
-### 3. Deploy on a GCE VM with Docker Compose
+---
 
-Cloud Run is stateless and cannot run MongoDB + Redis sidecars. The simplest all-GCP approach is a single **e2-micro** Compute Engine VM running `docker compose up` — no third-party accounts required.
+### Step 4 — Create the VM (only needed once)
+
+The startup script runs automatically on first boot and pulls the image from
+Artifact Registry.
 
 ```bash
-# Create the VM (e2-micro is free-tier eligible)
 gcloud compute instances create ticketing-vm \
-  --zone=asia-southeast1-b \
-  --machine-type=e2-micro \
+  --zone=$ZONE \
+  --machine-type=e2-small \
   --image-family=cos-stable \
   --image-project=cos-cloud \
   --tags=http-server \
-  --metadata=startup-script='#! /bin/bash
-    docker pull YOUR_IMAGE
-    docker network create app || true
-    docker run -d --name mongo --network app mongo:7
-    docker run -d --name redis --network app redis:7-alpine
+  --scopes=cloud-platform \
+  --metadata=startup-script="#! /bin/bash
+    # Authenticate Docker on the VM using the instance service account
+    gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+    # Pull images
+    docker pull ${IMAGE}:latest
+    docker pull mongo:7
+    docker pull redis:7-alpine
+
+    # Create shared network
+    docker network create app 2>/dev/null || true
+
+    # Start MongoDB
+    docker run -d --name mongo --network app \
+      -v mongo_data:/data/db \
+      mongo:7
+
+    # Start Redis
+    docker run -d --name redis --network app \
+      redis:7-alpine
+
+    # Wait for dependencies
+    sleep 5
+
+    # Start API
     docker run -d --name api --network app \
       -p 80:8080 \
       -e NODE_ENV=production \
       -e MONGO_URI=mongodb://mongo:27017/ticketing \
       -e REDIS_URL=redis://redis:6379 \
       -e SEAT_HOLD_TTL_SECONDS=600 \
-      YOUR_IMAGE'
+      ${IMAGE}:latest"
 
-# Allow HTTP traffic
+# Allow HTTP on port 80
 gcloud compute firewall-rules create allow-http \
   --allow=tcp:80 \
-  --target-tags=http-server
+  --target-tags=http-server \
+  --project=$PROJECT_ID 2>/dev/null || echo "Firewall rule already exists"
 ```
 
-> Replace `YOUR_IMAGE` with the Artifact Registry image URI from step 2.
+---
 
-### 4. Verify deployment
+### Step 5 — Verify the deployment
 
 ```bash
-VM_IP=$(gcloud compute instances describe ticketing-vm \
-  --zone=asia-southeast1-b \
+export VM_IP=$(gcloud compute instances describe ticketing-vm \
+  --zone=$ZONE \
   --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
+echo "VM IP: $VM_IP"
+
+# Wait ~60 seconds for startup script to finish, then:
 curl http://${VM_IP}/health
 # → {"status":"ok"}
 
-# Swagger UI
-echo "http://${VM_IP}/api/docs"
+echo "Swagger UI: http://${VM_IP}/api/docs"
+```
+
+---
+
+### Redeploying a new version (CI/CD update flow)
+
+When you push new code, run steps 3 + this redeploy command:
+
+```bash
+export TAG=$(git rev-parse --short HEAD)
+
+# SSH into the VM and restart the API container with the new image
+gcloud compute ssh ticketing-vm --zone=$ZONE --command="
+  docker pull ${IMAGE}:latest
+  docker stop api && docker rm api
+  docker run -d --name api --network app \
+    -p 80:8080 \
+    -e NODE_ENV=production \
+    -e MONGO_URI=mongodb://mongo:27017/ticketing \
+    -e REDIS_URL=redis://redis:6379 \
+    -e SEAT_HOLD_TTL_SECONDS=600 \
+    ${IMAGE}:latest
+  echo 'Deployed ${IMAGE}:latest'
+"
+```
+
+Only the API container is restarted — MongoDB and Redis keep their data.
+
+---
+
+### Check VM logs (debugging)
+
+```bash
+# Stream all container logs
+gcloud compute ssh ticketing-vm --zone=$ZONE --command="docker logs api --tail=50 -f"
+
+# Check startup script output
+gcloud compute instances get-serial-port-output ticketing-vm --zone=$ZONE | tail -40
 ```
 
 ## API quick-start (cURL examples)
