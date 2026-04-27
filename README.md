@@ -1,6 +1,10 @@
 # Ticketing API
 
-Backend ticketing system built with NestJS + TypeScript + MongoDB + Redis, containerised with Docker, deployable to GCP Cloud Run.
+Backend ticketing system built with NestJS + TypeScript + MongoDB + Redis, containerised with Docker, deployed on GCP.
+
+**Live deployment (GCE VM — asia-southeast2-b):**
+- Health: http://34.128.124.240/health
+- Swagger UI: http://34.128.124.240/api/docs
 
 ## Architecture overview
 
@@ -169,8 +173,8 @@ echo "Pushed: ${IMAGE}:${TAG}"
 
 ### Step 4 — Create the VM (only needed once)
 
-The startup script runs automatically on first boot and pulls the image from
-Artifact Registry.
+COS (Container-Optimized OS) uses `docker-credential-gcr` instead of `gcloud`
+to authenticate against Artifact Registry.
 
 ```bash
 gcloud compute instances create ticketing-vm \
@@ -181,37 +185,22 @@ gcloud compute instances create ticketing-vm \
   --tags=http-server \
   --scopes=cloud-platform \
   --metadata=startup-script="#! /bin/bash
-    # Authenticate Docker on the VM using the instance service account
-    gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
-
-    # Pull images
-    docker pull ${IMAGE}:latest
-    docker pull mongo:7
-    docker pull redis:7-alpine
-
-    # Create shared network
-    docker network create app 2>/dev/null || true
-
-    # Start MongoDB
-    docker run -d --name mongo --network app \
-      -v mongo_data:/data/db \
-      mongo:7
-
-    # Start Redis
-    docker run -d --name redis --network app \
-      redis:7-alpine
-
-    # Wait for dependencies
-    sleep 5
-
-    # Start API
-    docker run -d --name api --network app \
-      -p 80:8080 \
-      -e NODE_ENV=production \
-      -e MONGO_URI=mongodb://mongo:27017/ticketing \
-      -e REDIS_URL=redis://redis:6379 \
-      -e SEAT_HOLD_TTL_SECONDS=600 \
-      ${IMAGE}:latest"
+docker-credential-gcr configure-docker \
+  --registries=${REGION}-docker.pkg.dev
+docker pull ${IMAGE}:latest
+docker pull mongo:7
+docker pull redis:7-alpine
+docker network create app
+docker run -d --name mongo --network app -v mongo_data:/data/db mongo:7
+docker run -d --name redis --network app redis:7-alpine
+sleep 10
+docker run -d --name api --network app \
+  -p 80:8080 \
+  -e NODE_ENV=production \
+  -e MONGO_URI=mongodb://mongo:27017/ticketing \
+  -e REDIS_URL=redis://redis:6379 \
+  -e SEAT_HOLD_TTL_SECONDS=600 \
+  ${IMAGE}:latest"
 
 # Allow HTTP on port 80
 gcloud compute firewall-rules create allow-http \
